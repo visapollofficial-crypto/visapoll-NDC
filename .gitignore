@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+.env.local
+functions/lib
+.emulator-data
+*.log
+serviceAccount*.json

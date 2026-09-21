@@ -1,0 +1,184 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function roleOf() { return request.auth.token.get('role', ''); }
+    function isStaff() { return signedIn() && roleOf() in ['moderator', 'admin', 'superadmin']; }
+    function isAdmin() { return signedIn() && roleOf() in ['admin', 'superadmin']; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    // Trial/paid access, read from the server-controlled subscriptions doc.
+    function hasPremium() {
+      let sub = get(/databases/$(database)/documents/subscriptions/$(request.auth.uid)).data;
+      return sub.status in ['trial', 'active'] && sub.endsAt != null && sub.endsAt > request.time;
+    }
+
+    // Profile: the owner may edit ONLY these harmless fields.
+    // verificationStatus, studentId, department, session, role etc. are server-controlled.
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isStaff();
+      allow create, delete: if false;
+      allow update: if isOwner(uid)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['phone', 'photoURL', 'scoreVisibility', 'section'])
+        && request.resource.data.phone.matches('^(\\+?88)?01[3-9][0-9]{8}$')
+        && request.resource.data.scoreVisibility in ['private', 'public']
+        && (request.resource.data.photoURL == null
+            || (request.resource.data.photoURL is string
+                && request.resource.data.photoURL.matches('^https://.*')
+                && request.resource.data.photoURL.size() <= 600))
+        && request.resource.data.section is string && request.resource.data.section.size() <= 20;
+    }
+
+    // Sanitised subset other students may see. Written by a Cloud Function trigger only.
+    match /publicProfiles/{uid} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    // Entitlements: trial + paid status. NEVER client-writable.
+    match /subscriptions/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow write: if false;
+    }
+    match /payments/{id} {
+      allow read: if (signedIn() && resource.data.uid == request.auth.uid) || isAdmin();
+      allow write: if false;
+    }
+
+    // Identity mapping and roster: backend only (admins may read the roster).
+    match /studentEntitlements/{hash} { allow read, write: if false; }
+    match /paymentIdempotency/{id}    { allow read, write: if false; }
+    match /rateLimits/{id}            { allow read, write: if false; }
+    match /studentRoster/{id}         { allow read: if isAdmin(); allow write: if false; }
+
+    match /settings/{id}      { allow read: if isAdmin(); allow write: if false; }
+    match /auditLogs/{id}     { allow read: if isAdmin(); allow write: if false; }
+    match /securityLogs/{id}  { allow read: if isAdmin(); allow write: if false; }
+
+    // ---- Feed (Phase 2) ----
+    // Posts are CREATED only through the createPost function (validation + rate limit).
+    // Counters (likeCount, commentCount, reportCount) are maintained by triggers, never by clients.
+    match /posts/{postId} {
+      allow read: if signedIn() && hasPremium() && (resource.data.status == 'active' || isStaff());
+      allow create, update: if false;
+      allow delete: if signedIn() && (resource.data.authorId == request.auth.uid || isStaff());
+
+      match /reactions/{uid} {
+        allow read: if signedIn() && hasPremium();
+        allow create: if isOwner(uid) && hasPremium()
+          && request.resource.data.keys().hasOnly(['createdAt'])
+          && request.resource.data.createdAt == request.time;
+        allow delete: if isOwner(uid);
+        allow update: if false;
+      }
+
+      match /comments/{commentId} {
+        allow read: if signedIn() && hasPremium();
+        allow create: if signedIn() && hasPremium()
+          && request.resource.data.keys().hasOnly(['authorId', 'authorName', 'text', 'createdAt'])
+          && request.resource.data.authorId == request.auth.uid
+          && request.resource.data.authorName == get(/databases/$(database)/documents/publicProfiles/$(request.auth.uid)).data.displayName
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 500
+          && request.resource.data.createdAt == request.time;
+        allow delete: if signedIn() && (resource.data.authorId == request.auth.uid || isStaff());
+        allow update: if false;
+      }
+    }
+
+    match /reports/{id} { allow read: if isStaff(); allow write: if false; }
+
+    // ---- Phase 3: academic content + verification ----
+    match /subjects/{id} { allow read: if signedIn(); allow write: if false; }
+
+    // Materials: written only via admin Cloud Functions. Students read published items while premium.
+    // (Department targeting is applied by the app's query; the content itself isn't secret between departments.)
+    match /classMaterials/{id} {
+      allow read: if signedIn() && ((hasPremium() && resource.data.status == 'published') || isAdmin());
+      allow write: if false;
+    }
+
+    match /verificationRequests/{uid} { allow read: if isOwner(uid) || isAdmin(); allow write: if false; }
+
+    // ---- Phase 4: quizzes ----
+    // Questions and answer keys are NEVER readable by students. Questions reach a student only through
+    // startAttempt (shuffled, without answers). Scores are written only by Cloud Functions.
+    match /questions/{id}    { allow read: if isAdmin(); allow write: if false; }
+    match /questionKeys/{id} { allow read: if isAdmin(); allow write: if false; }
+    match /quizzes/{id} {
+      allow read: if signedIn() && ((hasPremium() && resource.data.status == 'published') || isAdmin());
+      allow write: if false;
+    }
+    match /quizAttempts/{id} { allow read, write: if false; }
+    match /quizReviews/{id}  { allow read, write: if false; }
+    match /attemptCounters/{id} { allow read: if signedIn() && resource.data.uid == request.auth.uid; allow write: if false; }
+    match /quizResults/{id} { allow read: if (signedIn() && resource.data.uid == request.auth.uid) || isAdmin(); allow write: if false; }
+
+    // ---- Phase 5: AI usage log (no prompts or student text are stored) ----
+    match /aiRequests/{id} { allow read: if isAdmin(); allow write: if false; }
+
+    // ---- Phase 6: notifications ----
+    // Created only by Cloud Functions. The owner may read theirs and flip only the `read` flag.
+    match /notifications/{id} {
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+      allow update: if signedIn() && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+        && request.resource.data.read is bool;
+      allow create, delete: if false;
+    }
+    match /notificationPrefs/{uid} {
+      allow read: if isOwner(uid);
+      allow write: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['quiz', 'material', 'announcements', 'social'])
+        && request.resource.data.quiz is bool && request.resource.data.material is bool
+        && request.resource.data.announcements is bool && request.resource.data.social is bool;
+    }
+    match /fcmTokens/{uid} { allow read, write: if false; } // device tokens: functions only
+
+    // ---- Phase 7: payments ----
+    // Payment records (incl. status) are written only by Cloud Functions; students can read their own.
+    match /incomingPayments/{id} { allow read: if isAdmin(); allow write: if false; }
+    match /unparsedSms/{id}      { allow read: if isAdmin(); allow write: if false; }
+
+    // ---- Phase 8: chat + homework ----
+    // Chats are created/listed/written only through Cloud Functions (validation, rate limits, blocks, restrictions).
+    // Students can READ messages only in chats they belong to. Admins can read GROUP chats only (DMs only appear as report evidence).
+    function chatData(chatId) { return get(/databases/$(database)/documents/chats/$(chatId)).data; }
+    function myUser() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function inChat(chatId) {
+      return chatData(chatId).type == 'dm'
+        ? request.auth.uid in chatData(chatId).members
+        : (chatData(chatId).department == 'All' || chatData(chatId).department == myUser().department)
+          && (chatData(chatId).sectionKey == null || chatData(chatId).sectionKey == myUser().section.lower());
+    }
+    match /chats/{chatId} {
+      allow read: if isAdmin();
+      allow write: if false;
+      match /messages/{mid} {
+        allow read: if signedIn() && ((hasPremium() && inChat(chatId)) || (isAdmin() && chatData(chatId).type == 'group'));
+        allow write: if false;
+      }
+    }
+    // A student's own block list (the server checks it before delivering messages).
+    match /blocks/{uid}/list/{other} {
+      allow read, delete: if isOwner(uid);
+      allow create: if isOwner(uid) && other != uid
+        && request.resource.data.keys().hasOnly(['name', 'createdAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 80
+        && request.resource.data.createdAt == request.time;
+      allow update: if false;
+    }
+    match /homeworkHistory/{id} {
+      allow read, delete: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create, update: if false;
+    }
+
+    // ---- Phase 9: analytics + insights ----
+    // Admins read anonymous daily summaries only. A student reads only their own insights. Nobody writes from the client.
+    match /analyticsDaily/{date} { allow read: if isAdmin(); allow write: if false; }
+    match /learningInsights/{uid} { allow read: if isOwner(uid); allow write: if false; }
+    match /activeUsers/{id} { allow read, write: if false; }
+
+    // Everything else is denied by default until its phase adds explicit rules.
+  }
+}

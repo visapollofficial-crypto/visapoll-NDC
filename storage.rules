@@ -1,0 +1,55 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() { return request.auth != null; }
+    function isImage() { return request.resource.contentType.matches('image/(jpeg|png|webp)'); }
+
+    match /profilePhotos/{uid}/{file} {
+      allow read: if signedIn();
+      allow write: if signedIn() && request.auth.uid == uid && isImage() && request.resource.size < 2 * 1024 * 1024;
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    // Feed media: images up to 5 MB, short mp4 video up to 25 MB, owner folder only.
+    match /feedMedia/{uid}/{file} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.uid == uid
+        && ((isImage() && request.resource.size < 5 * 1024 * 1024)
+            || (request.resource.contentType == 'video/mp4' && request.resource.size < 25 * 1024 * 1024));
+      allow delete: if signedIn() && request.auth.uid == uid;
+      allow update: if false;
+    }
+
+    // Class material attachments: uploaded by admins only, paths are unguessable and only revealed
+    // inside premium-gated Firestore documents.
+    match /classMaterials/{materialFolder}/{file} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.token.get('role', '') in ['admin', 'superadmin']
+        && request.resource.size < 25 * 1024 * 1024
+        && (request.resource.contentType == 'application/pdf'
+            || request.resource.contentType.matches('image/(jpeg|png|webp)')
+            || request.resource.contentType == 'video/mp4');
+      allow delete: if signedIn() && request.auth.token.get('role', '') in ['admin', 'superadmin'];
+      allow update: if false;
+    }
+
+    // Homework photos: private to the student; the AI function reads it once and deletes it.
+    match /homework/{uid}/{file} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn() && request.auth.uid == uid && isImage() && request.resource.size < 4 * 1024 * 1024;
+      allow delete: if signedIn() && request.auth.uid == uid;
+      allow update: if false;
+    }
+
+    // Verification documents: write-once by the owner, NEVER readable by clients.
+    // Admins view them through a Cloud Function that issues short-lived signed URLs.
+    match /verification/{uid}/{file} {
+      allow create: if signedIn() && request.auth.uid == uid && isImage()
+                    && request.resource.size < 5 * 1024 * 1024;
+      allow read, update, delete: if false;
+    }
+
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}
